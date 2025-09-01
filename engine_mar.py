@@ -7,7 +7,6 @@ import torch
 import util.misc as misc
 import util.lr_sched as lr_sched
 from models.vae import DiagonalGaussianDistribution
-import torch_fidelity
 import shutil
 import cv2
 import numpy as np

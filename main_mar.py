@@ -65,7 +65,7 @@ def get_args_parser():
     parser.add_argument('--cfg', default=1.0, type=float, help="classifier-free guidance")
     parser.add_argument('--cfg_schedule', default="linear", type=str)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
-    parser.add_argument('--eval_freq', type=int, default=1, help='evaluation frequency')
+    parser.add_argument('--eval_freq', type=int, default=2, help='evaluation frequency')
     parser.add_argument('--save_last_freq', type=int, default=5, help='save last frequency')
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate', action='store_true')

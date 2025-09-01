@@ -318,4 +318,4 @@ class ECG_Text_Dataset(Dataset):
         if torch.isnan(ecg).any() or torch.isinf(ecg).any():
             raise ValueError(f"NaN/Inf detected after augmentations at idx={idx}")
         
-        return ecg, 0
+        return ecg, ""

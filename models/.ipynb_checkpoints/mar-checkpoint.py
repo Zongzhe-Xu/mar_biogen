@@ -114,6 +114,7 @@ class TextEmbedder(nn.Module):
         )
         
         # For classifier-free guidance: empty text embedding
+        # self.register_buffer("empty_embedding", torch.randn(1, hidden_size) * 0.02)
         self.empty_embedding = nn.Parameter(torch.randn(1, hidden_size) * 0.02)
         
     def tokenize_text(self, text):
@@ -181,38 +182,42 @@ class TextEmbedder(nn.Module):
         return drop_ids
         
     def forward(self, text, train, force_drop_ids=None):
-        """
-        Forward pass of TextEmbedder.
-        Args:
-            text: string or list of strings
-            train: whether in training mode
-            force_drop_ids: optional tensor to force certain items to be dropped
-        Returns:
-            embeddings: (batch_size, hidden_size)
-        """
+        import torch.distributed as dist
         use_dropout = self.dropout_prob > 0
-        
-        # Tokenize text with both tokenizers
+
+        # Tokenize (CPU is fine here)
         text_input_ids_1, text_input_ids_2 = self.tokenize_text(text)
-        
-        # Apply dropout for classifier-free guidance
+
+        # Build per-sample mask on the same device as the token IDs (likely CPU)
         if (train and use_dropout) or (force_drop_ids is not None):
             drop_ids = self.token_drop(text_input_ids_1, text_input_ids_2, force_drop_ids)
         else:
             drop_ids = torch.zeros(text_input_ids_1.shape[0], dtype=torch.bool, device=text_input_ids_1.device)
-        
-        # Encode text
+
+        # Encode text -> embeddings are on the model/device (CUDA for DDP+NCCL)
         text_embeddings = self.encode_text(text_input_ids_1, text_input_ids_2)
-        drop_ids = drop_ids.to(text_embeddings.device)
-        # Replace dropped embeddings with empty embedding
+
+        # ***** MOVE/BROADCAST ON CUDA (NCCL requires CUDA tensors) *****
+        # 1) move mask to embeddings' device, 2) cast to int for NCCL, 3) broadcast
+        if dist.is_available() and dist.is_initialized():
+            sync = drop_ids.to(device=text_embeddings.device, dtype=torch.int32).contiguous()
+            dist.broadcast(sync, src=0)               # NCCL broadcast on CUDA tensor
+            drop_ids = sync.to(dtype=torch.bool)      # back to bool for masking
+        else:
+            drop_ids = drop_ids.to(text_embeddings.device)
+
+        # Replace dropped embeddings with learnable empty embedding
         if drop_ids.any():
-            device = text_embeddings.device
-            empty_emb = self.empty_embedding.to(device)
+            empty_emb = self.empty_embedding.to(text_embeddings.device)
             text_embeddings = torch.where(
                 drop_ids.unsqueeze(1).expand_as(text_embeddings),
                 empty_emb.expand(text_embeddings.shape[0], -1),
                 text_embeddings
             )
+
+        # Always-touch trick so empty_embedding gets a grad slot every step
+        text_embeddings = text_embeddings + 0.0 * self.empty_embedding.sum()
+
         return text_embeddings
 
 
@@ -471,27 +476,48 @@ class MAR(nn.Module):
         return mask
 
     def forward_mae_encoder(self, x, mask, class_embedding):
+        import torch.distributed as dist
         x = self.z_proj(x)
         bsz, seq_len, embed_dim = x.shape
 
         # concat buffer
-        x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
+        x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device, dtype=x.dtype), x], dim=1)
+        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device, dtype=mask.dtype), mask], dim=1)
 
-        # random drop class embedding during training
+        # --- Classifier-free drop of class embedding (DDP-safe) ---
         if self.training:
-            drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            drop_latent_mask = drop_latent_mask.unsqueeze(-1).to(x.device).to(x.dtype)
-            class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
+            # per-rank draw, then broadcast so ALL ranks use THE SAME mask
+            drop_latent_mask = (torch.rand(bsz, device=x.device) < self.label_drop_prob)
 
-        x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
+            if dist.is_available() and dist.is_initialized():
+                t = drop_latent_mask.to(torch.int32).contiguous()
+                dist.broadcast(t, src=0)              # every rank now has identical mask
+                drop_latent_mask = t.bool()
+
+            # shape + dtype alignment
+            drop_latent_mask = drop_latent_mask.unsqueeze(-1).to(dtype=x.dtype)
+
+            # select unconditional vs conditional class embedding
+            #   self.fake_latent: [1, D]  -> expand to [B, D]
+            class_embedding = torch.where(
+                drop_latent_mask.bool(),
+                self.fake_latent.expand(bsz, -1).to(dtype=class_embedding.dtype, device=class_embedding.device),
+                class_embedding
+            )
+
+            # Always-touch trick: ensure fake_latent participates in the graph every step
+            # (adds zero, but creates a grad path so DDP hooks fire even if mask is all False)
+            class_embedding = class_embedding + 0.0 * self.fake_latent.sum()
+
+        # write class tokens into the prefix buffer
+        x[:, :self.buffer_size] = class_embedding.to(dtype=x.dtype, device=x.device).unsqueeze(1)
 
         # encoder position embedding
         x = x + self.encoder_pos_embed_learned
         x = self.z_proj_ln(x)
 
         # dropping
-        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
+        x = x[(~mask_with_buffer.bool()).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
 
         # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -512,7 +538,7 @@ class MAR(nn.Module):
         # pad mask tokens
         mask_tokens = self.mask_token.repeat(mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
         x_after_pad = mask_tokens.clone()
-        x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        x_after_pad[(~mask_with_buffer.bool()).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
 
         # decoder position embedding
         x = x_after_pad + self.decoder_pos_embed_learned
