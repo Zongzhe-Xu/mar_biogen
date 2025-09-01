@@ -100,12 +100,13 @@ def evaluate(model_without_ddp, ema_params, args, epoch, batch_size=16, log_writ
              use_ema=True):
     model_without_ddp.eval()
     num_steps = args.num_samples // (batch_size * misc.get_world_size()) + 1
-    save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-samples{}".format(args.num_iter,
+    save_folder = os.path.join(args.output_dir, "ariter{}-diffsteps{}-temp{}-{}cfg{}-samples{}-epoch{}".format(args.num_iter,
                                                                                                      args.num_sampling_steps,
                                                                                                      args.temperature,
                                                                                                      args.cfg_schedule,
                                                                                                      cfg,
-                                                                                                     args.num_samples))
+                                                                                                     args.num_samples,
+                                                                                                     epoch))
     if use_ema:
         save_folder = save_folder + "_ema"
     if args.evaluate:
