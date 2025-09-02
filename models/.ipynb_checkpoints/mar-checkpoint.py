@@ -221,11 +221,19 @@ class TextEmbedder(nn.Module):
         return text_embeddings
 
 
+# def mask_by_order(mask_len, order, bsz, seq_len):
+#     device = order.device  # Use the same device as the input tensor
+#     masking = torch.zeros(bsz, seq_len, device=device)
+#     masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len, device=device)).bool()
+#     return masking
+
 def mask_by_order(mask_len, order, bsz, seq_len):
-    device = order.device  # Use the same device as the input tensor
+    device = order.device
+    mlen = int(mask_len.item() if torch.is_tensor(mask_len) else mask_len)
+    idx = order[:, :mlen].long()                # Long indices are required
     masking = torch.zeros(bsz, seq_len, device=device)
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len, device=device)).bool()
-    return masking
+    masking.scatter_(dim=-1, index=idx, value=1.0)
+    return masking.bool()
 
 
 class MAR(nn.Module):
@@ -306,7 +314,7 @@ class MAR(nn.Module):
                 raise ValueError("sd3_model_path must be provided when use_text_conditioning=True")
             self.text_embedder = TextEmbedder(
                 hidden_size=encoder_embed_dim, 
-                dropout_prob=label_drop_prob,
+                dropout_prob=0.0,
                 sd3_model_path=sd3_model_path
             )
             # Fake embedding for CFG's unconditional generation
@@ -610,8 +618,89 @@ class MAR(nn.Module):
 
         return loss
 
-    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
+#     def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
 
+#         # init and sample generation orders
+#         device = next(self.parameters()).device
+#         mask = torch.ones(bsz, self.seq_len, device=device)
+#         # tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim, device=device)
+#         tokens = torch.zeros(bsz, self.seq_len, self.timeseries_channels*self.patch_size, device=device)
+#         orders = self.sample_orders(bsz)
+
+#         indices = list(range(num_iter))
+#         if progress:
+#             indices = tqdm(indices)
+#         # generate latents
+#         for step in indices:
+#             cur_tokens = tokens.clone()
+
+#             patched_tokens = self.patchify(self.unpatchify(cur_tokens))
+
+#             # class embedding and CFG
+#             if labels is not None:
+#                 if self.use_text_conditioning:
+#                     # Text conditioning
+#                     class_embedding = self.text_embedder(labels, train=False)
+#                 else:
+#                     # Label conditioning
+#                     class_embedding = self.class_emb(labels)
+#             else:
+#                 class_embedding = self.fake_latent.repeat(bsz, 1)
+#             if not cfg == 1.0:
+#                 patched_tokens = torch.cat([patched_tokens, patched_tokens], dim=0)
+#                 class_embedding = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
+#                 mask = torch.cat([mask, mask], dim=0)
+
+#             # mae encoder
+#             x = self.forward_mae_encoder(patched_tokens, mask, class_embedding)
+
+#             # mae decoder
+#             z = self.forward_mae_decoder(x, mask)
+
+#             # mask ratio for the next round, following MaskGIT and MAGE.
+#             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+#             mask_len = torch.tensor([np.floor(self.seq_len * mask_ratio)], device=device)
+
+#             # masks out at least one for the next iteration
+#             mask_len = torch.maximum(torch.tensor([1], device=device),
+#                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
+
+#             # get masking for next iteration and locations to be predicted in this iteration
+#             mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
+#             if step >= num_iter - 1:
+#                 mask_to_pred = mask[:bsz].bool()
+#             else:
+#                 mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
+#             mask = mask_next
+#             if not cfg == 1.0:
+#                 mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+
+#             # sample token latents for this step
+#             z = z[mask_to_pred.nonzero(as_tuple=True)].to(torch.float32)
+#             # cfg schedule follow Muse
+#             if cfg_schedule == "linear":
+#                 cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
+#             elif cfg_schedule == "constant":
+#                 cfg_iter = cfg
+#             else:
+#                 raise NotImplementedError
+#             # Make sure CFG is a Python float (not a 0-D tensor)
+#             cfg_iter = float(cfg_iter.item()) if torch.is_tensor(cfg_iter) else float(cfg_iter)
+#             sampled_token_latent = self.diffloss.sample(z, float(temperature), cfg_iter)
+#             if not cfg == 1.0:
+#                 sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
+#                 mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+
+#             cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
+#             tokens = cur_tokens.clone()
+
+#         # The diffusion model generates [batch_size, num_patches, timeseries_channels * patch_size]
+#         # Use unpatchify to convert back to [batch_size, timeseries_channels, seq_len]
+#         tokens = self.unpatchify(tokens)
+        
+#         return tokens
+
+    def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
         # init and sample generation orders
         device = next(self.parameters()).device
         mask = torch.ones(bsz, self.seq_len, device=device)
@@ -627,6 +716,8 @@ class MAR(nn.Module):
             cur_tokens = tokens.clone()
 
             patched_tokens = self.patchify(self.unpatchify(cur_tokens))
+            # ---- STEP 4 sentinel ----
+            assert torch.isfinite(patched_tokens).all(), "patched_tokens has non-finite values"
 
             # class embedding and CFG
             if labels is not None:
@@ -645,9 +736,13 @@ class MAR(nn.Module):
 
             # mae encoder
             x = self.forward_mae_encoder(patched_tokens, mask, class_embedding)
+            # ---- STEP 4 sentinel ----
+            assert torch.isfinite(x).all(), "encoder output x has non-finite values"
 
             # mae decoder
             z = self.forward_mae_decoder(x, mask)
+            # ---- STEP 4 sentinel ----
+            assert torch.isfinite(z).all(), "decoder output z has non-finite values"
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
@@ -668,7 +763,10 @@ class MAR(nn.Module):
                 mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
 
             # sample token latents for this step
-            z = z[mask_to_pred.nonzero(as_tuple=True)]
+            z = z[mask_to_pred.nonzero(as_tuple=True)].to(torch.float32)
+            # ---- STEP 4 sentinel ----
+            assert torch.isfinite(z).all(), "z (to sample) has non-finite values"
+
             # cfg schedule follow Muse
             if cfg_schedule == "linear":
                 cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
@@ -676,7 +774,12 @@ class MAR(nn.Module):
                 cfg_iter = cfg
             else:
                 raise NotImplementedError
-            sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+            # Make sure CFG is a Python float (not a 0-D tensor)
+            cfg_iter = float(cfg_iter.item()) if torch.is_tensor(cfg_iter) else float(cfg_iter)
+            sampled_token_latent = self.diffloss.sample(z, float(temperature), cfg_iter)
+            # ---- STEP 4 sentinel ----
+            assert torch.isfinite(sampled_token_latent).all(), "DiffLoss.sample produced non-finite values"
+
             if not cfg == 1.0:
                 sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
                 mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
@@ -687,7 +790,9 @@ class MAR(nn.Module):
         # The diffusion model generates [batch_size, num_patches, timeseries_channels * patch_size]
         # Use unpatchify to convert back to [batch_size, timeseries_channels, seq_len]
         tokens = self.unpatchify(tokens)
-        
+        # ---- STEP 4 sentinel ----
+        assert torch.isfinite(tokens).all(), "final tokens (after unpatchify) have non-finite values"
+
         return tokens
 
 

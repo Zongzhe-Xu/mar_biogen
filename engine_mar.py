@@ -164,7 +164,7 @@ def evaluate(model_without_ddp, ema_params, args, epoch, batch_size=16, log_writ
 
         # generation
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            # with torch.cuda.amp.autocast():
                 sampled_timeseries = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
                                                                    cfg_schedule=args.cfg_schedule, labels=labels_gen,
                                                                    temperature=args.temperature)
